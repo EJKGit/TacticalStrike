@@ -20,6 +20,65 @@ const MIME = {
   ".svg": "image/svg+xml", ".json": "application/json", ".css": "text/css",
 };
 
+// ------------------------------------------------------------------ unpack .zip files
+// GitHub's website only accepts uploads up to 25 MB, and the game's index.wasm is bigger.
+// Compress it in Finder (right-click > Compress) and upload index.wasm.zip instead:
+// at startup every .zip in public/ is unpacked next to itself (no dependencies needed).
+const zlib = require("zlib");
+
+function unzipFile(zipPath) {
+  const buf = fs.readFileSync(zipPath);
+  // find the End Of Central Directory record
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("not a zip file");
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);
+  const outDir = path.dirname(zipPath);
+  const written = [];
+  for (let n = 0; n < count; n++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) throw new Error("bad central directory");
+    const method = buf.readUInt16LE(p + 10);
+    const compSize = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const localOff = buf.readUInt32LE(p + 42);
+    const name = buf.toString("utf8", p + 46, p + 46 + nameLen);
+    p += 46 + nameLen + extraLen + commentLen;
+    // skip folders and macOS metadata (__MACOSX/, ._files, .DS_Store)
+    const base = path.basename(name);
+    if (name.endsWith("/") || name.startsWith("__MACOSX") || base.startsWith("._") || base === ".DS_Store") continue;
+    const lNameLen = buf.readUInt16LE(localOff + 26);
+    const lExtraLen = buf.readUInt16LE(localOff + 28);
+    const start = localOff + 30 + lNameLen + lExtraLen;
+    const data = buf.subarray(start, start + compSize);
+    let out;
+    if (method === 0) out = data;
+    else if (method === 8) out = zlib.inflateRawSync(data);
+    else throw new Error(`unsupported compression in ${name}`);
+    const dest = path.normalize(path.join(outDir, base));
+    if (!dest.startsWith(PUBLIC)) continue;
+    fs.writeFileSync(dest, out);
+    written.push(`${base} (${(out.length / 1048576).toFixed(1)} MB)`);
+  }
+  return written;
+}
+
+function unpackZips(dir) {
+  if (!fs.existsSync(dir)) return;
+  for (const f of fs.readdirSync(dir)) {
+    const full = path.join(dir, f);
+    if (fs.statSync(full).isDirectory()) { unpackZips(full); continue; }
+    if (!f.toLowerCase().endsWith(".zip")) continue;
+    try { console.log(`Unpacked ${f}: ${unzipFile(full).join(", ")}`); }
+    catch (e) { console.log(`Could not unpack ${f}: ${e.message}`); }
+  }
+}
+unpackZips(PUBLIC);
+
 // ------------------------------------------------------------------ static files
 const server = http.createServer((req, res) => {
   let url = "/";
@@ -27,7 +86,12 @@ const server = http.createServer((req, res) => {
   if (url === "/") url = "/index.html";
   const file = path.normalize(path.join(PUBLIC, url));
   if (!file.startsWith(PUBLIC)) { res.writeHead(403); res.end(); return; }
-  fs.stat(file, (err, st) => {
+  // A gzipped copy (e.g. index.wasm.gz) is served in place of a missing file. This keeps
+  // the big .wasm under GitHub's 25 MB browser-upload limit.
+  let gzipped = false;
+  if (!fs.existsSync(file) && fs.existsSync(file + ".gz")) gzipped = true;
+  const real = gzipped ? file + ".gz" : file;
+  fs.stat(real, (err, st) => {
     if (err || !st.isFile()) {
       res.writeHead(404, { "Content-Type": "text/plain" });
       res.end(fs.existsSync(path.join(PUBLIC, "index.html"))
@@ -35,14 +99,16 @@ const server = http.createServer((req, res) => {
         : "Tactical Strike server is running. Export the Godot web build into server/public/ to play in the browser.");
       return;
     }
-    res.writeHead(200, {
+    const headers = {
       "Content-Type": MIME[path.extname(file).toLowerCase()] || "application/octet-stream",
       // needed if the web export is built with thread support; harmless otherwise
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",
       "Cache-Control": "no-cache",
-    });
-    fs.createReadStream(file).pipe(res);
+    };
+    if (gzipped) headers["Content-Encoding"] = "gzip";
+    res.writeHead(200, headers);
+    fs.createReadStream(real).pipe(res);
   });
 });
 
