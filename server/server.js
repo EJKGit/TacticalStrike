@@ -1,10 +1,11 @@
 // Tactical Strike relay + web host. No dependencies: needs only Node 18+.
 //
 //  - Serves the Godot web export from ./public  (http://host:PORT/)
-//  - WebSocket relay on /ws with 4-letter rooms (one host + one guest each).
+//  - WebSocket relay on /ws with 4-letter rooms of up to 4 players.
 //    {"t":"create"}            -> {"t":"created","code":"ABCD"}
 //    {"t":"join","code":"ABCD"} -> guest gets {"t":"joined"}, host gets {"t":"peer_joined"}
-//    any other message is forwarded unchanged to the other player in the room.
+//    any other message is forwarded to the others in the room (or just to "to": <player id>),
+//    tagged with "from": <sender's player id>.
 //    When someone leaves, the other gets {"t":"peer_left"}.
 
 const http = require("http");
@@ -182,7 +183,12 @@ class Client {
 }
 
 // ------------------------------------------------------------------ rooms
-const rooms = new Map();   // code -> {host, guest}
+// A room holds up to MAX_PLAYERS. The creator is player 1 (the host); joiners get
+// 2, 3, 4. Every relayed message gets "from": <player id>. A message with "to": <id>
+// goes only to that player, anything else goes to everyone else in the room.
+// The room lives until the last player leaves.
+const MAX_PLAYERS = 4;
+const rooms = new Map();   // code -> {members: Map(pid -> client), next: int}
 const clients = new Set();
 const LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // no I / O
 
@@ -195,26 +201,15 @@ function newCode() {
   return null;
 }
 
-function other(client) {
-  const r = client.room && rooms.get(client.room);
-  if (!r) return null;
-  return r.host === client ? r.guest : r.host;
-}
-
 function leaveRoom(client) {
   const code = client.room;
   if (!code) return;
   client.room = null;
   const r = rooms.get(code);
   if (!r) return;
-  const peer = r.host === client ? r.guest : r.host;
-  if (r.host === client) {
-    rooms.delete(code);            // host left: room is gone
-    if (peer) { peer.room = null; peer.sendJson({ t: "peer_left" }); }
-  } else {
-    r.guest = null;                // guest left: host can wait for someone else
-    if (peer) peer.sendJson({ t: "peer_left" });
-  }
+  r.members.delete(client.pid);
+  if (r.members.size === 0) { rooms.delete(code); return; }
+  for (const c of r.members.values()) c.sendJson({ t: "peer_left", pid: client.pid, from: client.pid });
 }
 
 function onMessage(client, text) {
@@ -226,25 +221,35 @@ function onMessage(client, text) {
     leaveRoom(client);
     const code = newCode();
     if (!code) { client.sendJson({ t: "error", msg: "Server is full, try again later." }); return; }
-    rooms.set(code, { host: client, guest: null });
+    client.pid = 1;
+    rooms.set(code, { members: new Map([[1, client]]), next: 2 });
     client.room = code;
-    client.sendJson({ t: "created", code });
+    client.sendJson({ t: "created", code, pid: 1, peers: [1] });
     return;
   }
   if (msg.t === "join") {
     const code = String(msg.code || "").toUpperCase();
     const r = rooms.get(code);
     if (!r) { client.sendJson({ t: "error", msg: `No room called ${code}. Check the code.` }); return; }
-    if (r.guest) { client.sendJson({ t: "error", msg: `Room ${code} is already full.` }); return; }
+    if (r.members.size >= MAX_PLAYERS) { client.sendJson({ t: "error", msg: `Room ${code} is full (${MAX_PLAYERS} players).` }); return; }
     leaveRoom(client);
-    r.guest = client;
+    client.pid = r.next++;
+    for (const c of r.members.values()) c.sendJson({ t: "peer_joined", pid: client.pid, from: client.pid });
+    r.members.set(client.pid, client);
     client.room = code;
-    client.sendJson({ t: "joined", code });
-    r.host.sendJson({ t: "peer_joined" });
+    client.sendJson({ t: "joined", code, pid: client.pid, peers: [...r.members.keys()] });
     return;
   }
-  const peer = other(client);
-  if (peer) peer.send(text);       // relay everything else untouched
+  const r = client.room && rooms.get(client.room);
+  if (!r) return;
+  msg.from = client.pid;
+  const out = JSON.stringify(msg);
+  if (msg.to !== undefined) {
+    const target = r.members.get(Number(msg.to));
+    if (target && target !== client) target.send(out);
+    return;
+  }
+  for (const c of r.members.values()) if (c !== client) c.send(out);
 }
 
 server.on("upgrade", (req, socket) => {
